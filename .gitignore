@@ -1,9 +1,36 @@
+# Environment
 .env
+.env.local
+.env.*.local
+
+# Python bytecode
 __pycache__/
-.venv/
-outputs/
 *.pyc
-.DS_Store
+*.pyo
+
+# Virtual environment
+.venv/
+
+# uv
+.uv/
+
+# Project runtime output (generated files, logs)
+outputs/
+
+# Distribution / packaging
 dist/
 build/
 *.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checking / linters
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store

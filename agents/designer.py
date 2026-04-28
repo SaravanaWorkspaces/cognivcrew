@@ -13,8 +13,8 @@ from graph.state import CognivCrewState
 
 console = Console()
 
-_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "pm_prompt.txt"
-_llm = ChatAnthropic(model=cfg.MODEL, temperature=cfg.TEMP_PM)
+_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "designer_prompt.txt"
+_llm = ChatAnthropic(model=cfg.MODEL, temperature=cfg.TEMP_DESIGNER)
 
 
 @llm_retry
@@ -22,16 +22,17 @@ def _call_llm(messages: list):
     return _llm.invoke(messages, config=RunnableConfig(callbacks=[usage_handler]))
 
 
-def pm_node(state: CognivCrewState) -> CognivCrewState:
-    logger.info("PM agent starting")
+def designer_node(state: CognivCrewState) -> CognivCrewState:
+    logger.info("Designer agent starting")
     system_prompt = _PROMPT_PATH.read_text()
-    logger.debug(f"PM system prompt ({len(system_prompt)} chars)")
+    logger.debug(f"Designer system prompt ({len(system_prompt)} chars)")
 
     human_message = (
         f"## Original User Request\n\n{state['user_request']}\n\n"
-        f"## CEO Strategy\n\n{state['strategy']}"
+        f"## CEO Strategy\n\n{state['strategy']}\n\n"
+        f"## Product Specification\n\n{state['product_spec']}"
     )
-    logger.debug(f"PM human message ({len(human_message)} chars)")
+    logger.debug(f"Designer human message ({len(human_message)} chars)")
 
     messages = [
         SystemMessage(content=system_prompt),
@@ -39,18 +40,18 @@ def pm_node(state: CognivCrewState) -> CognivCrewState:
     ]
 
     response = _call_llm(messages)
-    state["product_spec"] = response.content
+    state["design_brief"] = response.content
 
-    output_path = Path(state["output_dir"]) / "01_product_spec.md"
+    output_path = Path(state["output_dir"]) / "02_design_brief.md"
     output_path.write_text(response.content)
 
-    logger.info(f"PM agent complete — product spec written to {output_path}")
+    logger.info(f"Designer agent complete — design brief written to {output_path}")
 
     console.print(
         Panel(
-            f"[bold green]Product specification complete.[/bold green]\n"
+            f"[bold green]Design brief complete.[/bold green]\n"
             f"Saved to: [bold white]{output_path}[/bold white]",
-            title="[bold cyan]PM Agent[/bold cyan]",
+            title="[bold cyan]Designer Agent[/bold cyan]",
             expand=False,
         )
     )
