@@ -54,7 +54,7 @@ def engineer_node(state: CognivCrewState) -> CognivCrewState:
     response = _call_llm(messages)
     state["implementation_plan"] = response.content
 
-    output_path = Path(state["output_dir"]) / "03_implementation_plan.md"
+    output_path = Path(state["output_dir"]) / cfg.FILE_IMPLEMENTATION_PLAN
     output_path.write_text(response.content)
 
     iteration_label = f" (revision {iteration})" if iteration > 0 else ""

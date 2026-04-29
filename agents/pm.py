@@ -41,7 +41,7 @@ def pm_node(state: CognivCrewState) -> CognivCrewState:
     response = _call_llm(messages)
     state["product_spec"] = response.content
 
-    output_path = Path(state["output_dir"]) / "01_product_spec.md"
+    output_path = Path(state["output_dir"]) / cfg.FILE_PRODUCT_SPEC
     output_path.write_text(response.content)
 
     logger.info(f"PM agent complete — product spec written to {output_path}")

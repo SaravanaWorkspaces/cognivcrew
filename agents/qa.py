@@ -61,7 +61,7 @@ def qa_node(state: CognivCrewState) -> CognivCrewState:
     state["qa_feedback"] = fail_reasons
     state["iteration"] = iteration
 
-    output_path = Path(state["output_dir"]) / "04_qa_report.md"
+    output_path = Path(state["output_dir"]) / cfg.FILE_QA_REPORT
     output_path.write_text(report)
 
     if passed:

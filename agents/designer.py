@@ -42,7 +42,7 @@ def designer_node(state: CognivCrewState) -> CognivCrewState:
     response = _call_llm(messages)
     state["design_brief"] = response.content
 
-    output_path = Path(state["output_dir"]) / "02_design_brief.md"
+    output_path = Path(state["output_dir"]) / cfg.FILE_DESIGN_BRIEF
     output_path.write_text(response.content)
 
     logger.info(f"Designer agent complete — design brief written to {output_path}")
