@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,8 +23,10 @@ from rich.text import Text
 
 from callbacks import setup_logging, usage_handler
 from config import cfg
+from config.execution import EXECUTION_MODE as _DEFAULT_EXECUTION_MODE
 from graph.state import CognivCrewState, default_state
 from graph.workflow import app
+from orchestration.execution_selector import ExecutionMode, get_execution_mode, select_executor
 
 cli = typer.Typer(
     name="cognivcrew",
@@ -93,17 +96,28 @@ _OUTPUT_FILES_ORDERED = [
 # Validation helpers
 # ---------------------------------------------------------------------------
 
-def _check_items() -> list[tuple[str, bool, str]]:
+def _check_items(exec_mode: ExecutionMode = ExecutionMode.API) -> list[tuple[str, bool, str]]:
     """Return list of (label, passed, fix_instruction) for every check."""
     items: list[tuple[str, bool, str]] = []
 
-    # Env vars
-    api_key_set = bool(os.getenv("ANTHROPIC_API_KEY"))
-    items.append((
-        "ANTHROPIC_API_KEY",
-        api_key_set,
-        "Set ANTHROPIC_API_KEY in your .env file — get a key at https://console.anthropic.com",
-    ))
+    if exec_mode == ExecutionMode.PRO_NATIVE:
+        # Pro Native mode: check Claude Code CLI auth instead of API key
+        from orchestration.pro_native_executor import ProNativeExecutor
+        ok, message = ProNativeExecutor.check_auth()
+        items.append((
+            "Claude Code CLI authenticated (Pro plan)",
+            ok,
+            message if not ok else "",
+        ))
+    else:
+        # API mode: require ANTHROPIC_API_KEY
+        api_key_set = bool(os.getenv("ANTHROPIC_API_KEY"))
+        items.append((
+            "ANTHROPIC_API_KEY",
+            api_key_set,
+            "Set ANTHROPIC_API_KEY in your .env file — get a key at https://console.anthropic.com",
+        ))
+
     langsmith_set = bool(os.getenv("LANGCHAIN_API_KEY"))
     items.append((
         "LANGCHAIN_API_KEY (optional — LangSmith tracing)",
@@ -152,10 +166,13 @@ def _check_items() -> list[tuple[str, bool, str]]:
     return items
 
 
-def _validate_startup(exit_on_failure: bool = True) -> list[str]:
+def _validate_startup(
+    exit_on_failure: bool = True,
+    exec_mode: ExecutionMode = ExecutionMode.API,
+) -> list[str]:
     """Return list of Rich-markup error strings; exits if exit_on_failure and any hard errors."""
     errors: list[str] = []
-    for label, passed, fix in _check_items():
+    for label, passed, fix in _check_items(exec_mode):
         if not passed and "optional" not in label.lower():
             errors.append(f"[bold]{label}[/bold] — {fix}")
     if errors and exit_on_failure:
@@ -320,9 +337,21 @@ def handle_approval_gate(state: CognivCrewState) -> dict:
 def run(
     project: str = typer.Argument(..., help="Software project description"),
     langsmith: bool = typer.Option(False, "--langsmith", help="Enable LangSmith tracing"),
+    mode: str = typer.Option(
+        None, "--mode",
+        help="Execution mode: 'api' (default) or 'pro_native' (Claude Pro plan, no API key)",
+    ),
 ):
     """Run the full CognivCrew AI pipeline on a project description."""
-    _validate_startup()
+    # Resolve execution mode (CLI flag > env var > default "api")
+    raw_mode = mode or _DEFAULT_EXECUTION_MODE
+    try:
+        exec_mode = ExecutionMode(raw_mode.lower().strip())
+    except ValueError:
+        console.print(f"[red]Unknown --mode '{raw_mode}'. Choose 'api' or 'pro_native'.[/red]")
+        raise SystemExit(1)
+
+    _validate_startup(exec_mode=exec_mode)
 
     if langsmith and not os.getenv("LANGCHAIN_API_KEY"):
         console.print("[yellow]Warning: --langsmith set but LANGCHAIN_API_KEY is not set.[/yellow]")
@@ -335,17 +364,22 @@ def run(
     setup_logging(str(output_dir))
     usage_handler.reset()
 
-    logger.info(f"Pipeline starting — thread_id={thread_id}")
+    logger.info(f"Pipeline starting — mode={exec_mode.value} thread_id={thread_id}")
     logger.info(f"Project: {project[:200]}")
     logger.info(f"Output directory: {output_dir}")
 
-    # Startup banner
     request_preview = project if len(project) <= 80 else project[:77] + "..."
+    mode_display = (
+        f"[dim]Mode:[/dim]    [white]Pro Native (Claude Pro plan)[/white]\n"
+        if exec_mode == ExecutionMode.PRO_NATIVE
+        else f"[dim]Mode:[/dim]    [white]API (ANTHROPIC_API_KEY)[/white]\n"
+    )
     console.print(
         Panel(
             f"[bold yellow]{request_preview}[/bold yellow]\n\n"
             f"[dim]Output:[/dim]  [white]{output_dir}[/white]\n"
             f"[dim]Model:[/dim]   [white]{cfg.MODEL}[/white]\n"
+            f"{mode_display}"
             f"[dim]Thread:[/dim]  [white]{thread_id}[/white]",
             title="[bold cyan]CognivCrew v{} — Starting Pipeline[/bold cyan]".format(cfg.VERSION),
             expand=False,
@@ -353,6 +387,18 @@ def run(
         )
     )
 
+    wall_start = time.perf_counter()
+
+    if exec_mode == ExecutionMode.PRO_NATIVE:
+        _run_pro_native(
+            project=project,
+            output_dir=output_dir,
+            thread_id=thread_id,
+            wall_start=wall_start,
+        )
+        return
+
+    # ── API mode (existing LangGraph flow) ────────────────────────────────
     initial_state: CognivCrewState = {
         **default_state(),
         "user_request": project,
@@ -369,7 +415,6 @@ def run(
         tags=["cognivcrew", f"run-{timestamp}"],
     )
 
-    wall_start   = time.perf_counter()
     node_timings: dict[str, float] = {}
     agent_states: dict[str, dict]  = {k: {} for k in _AGENT_LABELS}
     last_time    = [wall_start]
@@ -435,6 +480,144 @@ def run(
         f"cost=${usage_handler.estimated_cost():.4f}"
     )
     _print_run_summary(final_state, total_duration, node_timings)
+
+
+# ---------------------------------------------------------------------------
+# Pro Native execution helper
+# ---------------------------------------------------------------------------
+
+def _run_pro_native(
+    project: str,
+    output_dir: Path,
+    thread_id: str,
+    wall_start: float,
+) -> None:
+    """Full pipeline execution via Claude Code CLI (Pro plan tokens)."""
+    from orchestration.pro_native_executor import ProNativeExecutor
+
+    executor = ProNativeExecutor()
+
+    initial_state: CognivCrewState = {
+        **default_state(),
+        "user_request": project,
+        "output_dir": str(output_dir),
+    }
+
+    # Phase 1 — Planning (CEO → PM → Architect → Designer)
+    state = executor.run_planning_phase(
+        initial_state,
+        approval_callback=handle_approval_gate,
+        max_architect_iterations=cfg.MAX_ARCHITECT_ITERATIONS,
+    )
+
+    # Phase 2 — Code Gen (Engineer → QA)
+    state = executor.run_codegen_phase(state, max_qa_iterations=cfg.MAX_ITERATIONS)
+
+    # Final assembly (same non-LLM node as the API workflow)
+    from graph.workflow import final_node
+    state = final_node(state)
+
+    total_duration = time.perf_counter() - wall_start
+    logger.info(
+        f"Pro Native pipeline complete — {total_duration:.1f}s\n"
+        f"{executor.cost_report()}"
+    )
+    _print_run_summary_pro_native(state, total_duration, executor)
+
+
+# ---------------------------------------------------------------------------
+# CLI — auth-pro
+# ---------------------------------------------------------------------------
+
+@cli.command(name="auth-pro")
+def auth_pro():
+    """Authenticate Claude Code CLI for Pro Native execution mode."""
+    from orchestration.pro_native_executor import ProNativeExecutor
+    import shutil
+
+    console.print(
+        Panel(
+            "[bold cyan]Pro Native Mode — Authentication[/bold cyan]\n\n"
+            "This mode uses your Claude Pro plan for all agent calls.\n"
+            "[dim]No ANTHROPIC_API_KEY required.[/dim]",
+            title="[bold]CognivCrew — Auth Pro[/bold]",
+            expand=False,
+        )
+    )
+
+    if not ProNativeExecutor.is_cli_available():
+        console.print(
+            Panel(
+                "[bold red]Claude Code CLI not found.[/bold red]\n\n"
+                "Install it with:\n"
+                "  [bold]npm install -g @anthropic-ai/claude-code[/bold]\n\n"
+                "Then re-run:  [bold]cognivcrew auth-pro[/bold]",
+                title="[bold red]Installation Required[/bold red]",
+                expand=False,
+            )
+        )
+        raise SystemExit(1)
+
+    ok, message = ProNativeExecutor.check_auth()
+    if ok:
+        console.print(Panel(
+            f"[bold green]{message}[/bold green]\n\n"
+            "You can now run:\n"
+            "  [bold]cognivcrew run --mode pro_native \"your project\"[/bold]\n\n"
+            "Or set [bold]EXECUTION_MODE=pro_native[/bold] in your .env file.",
+            title="[bold green]Already Authenticated[/bold green]",
+            expand=False,
+        ))
+        return
+
+    # Not authenticated — launch interactive claude session for the user to log in
+    console.print(
+        "\n[bold yellow]Launching Claude Code for interactive login…[/bold yellow]\n"
+        "[dim]A browser window will open. Complete the login there, then return here.[/dim]\n"
+    )
+    try:
+        subprocess.run(["claude", "--version"], check=False)
+        console.print(
+            "\n[bold]Run the following command in your terminal to log in:[/bold]\n"
+            "  [bold cyan]claude[/bold cyan]\n\n"
+            "[dim]Claude Code will prompt you to authenticate on first launch.[/dim]\n"
+            "Once done, run [bold]cognivcrew auth-status[/bold] to verify."
+        )
+    except OSError:
+        console.print("[red]Could not launch Claude Code CLI.[/red]")
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# CLI — auth-status
+# ---------------------------------------------------------------------------
+
+@cli.command(name="auth-status")
+def auth_status():
+    """Check Claude Code CLI authentication status for Pro Native mode."""
+    from orchestration.pro_native_executor import ProNativeExecutor
+
+    ok, message = ProNativeExecutor.check_auth()
+
+    if ok:
+        console.print(Panel(
+            f"[bold green]{message}[/bold green]\n\n"
+            "Pro Native execution mode is ready.\n"
+            "Cost per run: [bold]$0[/bold] (included in Claude Pro plan)\n\n"
+            "Run a project:\n"
+            "  [bold]cognivcrew run --mode pro_native \"your project description\"[/bold]",
+            title="[bold green]Auth Status — OK[/bold green]",
+            expand=False,
+        ))
+    else:
+        console.print(Panel(
+            f"[bold red]Not authenticated:[/bold red] {message}\n\n"
+            "To authenticate:\n"
+            "  [bold]cognivcrew auth-pro[/bold]",
+            title="[bold red]Auth Status — Not Ready[/bold red]",
+            expand=False,
+        ))
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +717,8 @@ def show(run_id: str = typer.Argument(..., help="Run timestamp (e.g. 20240428_14
 @cli.command()
 def validate():
     """Run a full configuration checklist and print pass/fail per item."""
-    items = _check_items()
+    exec_mode = get_execution_mode()
+    items = _check_items(exec_mode)
 
     table = Table(
         box=rich.box.SIMPLE,
@@ -549,10 +733,15 @@ def validate():
 
     failures: list[tuple[str, str]] = []
 
+    if exec_mode == ExecutionMode.PRO_NATIVE:
+        auth_label = "Claude Code CLI authenticated (Pro plan)"
+    else:
+        auth_label = "ANTHROPIC_API_KEY"
+
     sections = [
-        ("Environment Variables", ["ANTHROPIC_API_KEY", "LANGCHAIN_API_KEY (optional — LangSmith tracing)"]),
-        ("Prompt Files",          [f"prompts/{f}" for f in _PROMPT_FILES]),
-        ("System",                [f"{cfg.OUTPUT_DIR}/ directory writable"] + [f"import {p}" for p in _REQUIRED_PACKAGES]),
+        ("Auth / Credentials", [auth_label, "LANGCHAIN_API_KEY (optional — LangSmith tracing)"]),
+        ("Prompt Files",       [f"prompts/{f}" for f in _PROMPT_FILES]),
+        ("System",             [f"{cfg.OUTPUT_DIR}/ directory writable"] + [f"import {p}" for p in _REQUIRED_PACKAGES]),
     ]
 
     item_map = {label: (passed, fix) for label, passed, fix in items}
@@ -663,6 +852,39 @@ def info():
 # ---------------------------------------------------------------------------
 # Run summary
 # ---------------------------------------------------------------------------
+
+def _print_run_summary_pro_native(
+    state: CognivCrewState,
+    duration: float,
+    executor,
+) -> None:
+    """Summary panel for Pro Native runs (no exact token counts available)."""
+    qa_iterations        = state.get("iteration", 0)
+    architect_iterations = state.get("architect_iteration", 0)
+    output_dir           = state.get("output_dir", "—")
+    est                  = executor.token_estimate
+
+    timing_lines = "\n".join(
+        f"  {_AGENT_LABELS.get(node, node):<44} {t:.1f}s"
+        for node, t in executor.agent_timings.items()
+    )
+
+    summary = (
+        f"[bold]Total duration:[/bold]         {duration:.1f}s\n"
+        f"[bold]Architect iterations:[/bold]   {architect_iterations}\n"
+        f"[bold]QA iterations:[/bold]          {qa_iterations}\n"
+        f"[bold]Est. input tokens:[/bold]      ~{est.estimated_input_tokens:,}\n"
+        f"[bold]Est. output tokens:[/bold]     ~{est.estimated_output_tokens:,}\n"
+        f"[bold]Est. total tokens:[/bold]      ~{est.estimated_total_tokens:,}\n"
+        f"[bold]Estimated cost:[/bold]         {est.cost_display}\n"
+        f"[bold]Output path:[/bold]            {output_dir}\n"
+        f"\n[bold]Per-agent timing:[/bold]\n{timing_lines}"
+    )
+
+    console.print(
+        Panel(summary, title="[bold green]Run Summary — Pro Native[/bold green]", expand=False)
+    )
+
 
 def _print_run_summary(
     state: CognivCrewState,

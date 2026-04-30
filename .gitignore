@@ -32,5 +32,8 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Backup files
+*.bak
+
 # macOS
 .DS_Store
