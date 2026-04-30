@@ -7,6 +7,13 @@ api         Default. Uses the Anthropic API via ANTHROPIC_API_KEY.
             The existing LangGraph workflow handles execution.
 pro_native  Uses Claude Code CLI with the user's Claude Pro plan.
             No API key required. Returns a ProNativeExecutor instance.
+mock        Zero LLM calls. Pre-canned outputs for every pipeline stage.
+            Engineer stage always produces a hello_world.py application.
+
+Test layer
+----------
+Set TEST_MODE=true in your .env to force mock mode regardless of EXECUTION_MODE.
+Useful for CI, smoke tests, and pipeline validation without any API costs.
 """
 import os
 from enum import Enum
@@ -16,7 +23,7 @@ from loguru import logger
 from rich.console import Console
 from rich.panel import Panel
 
-from config.execution import EXECUTION_MODE as _ENV_MODE
+from config.execution import EXECUTION_MODE as _ENV_MODE, TEST_MODE
 
 console = Console()
 
@@ -24,13 +31,21 @@ console = Console()
 class ExecutionMode(str, Enum):
     API = "api"
     PRO_NATIVE = "pro_native"
+    MOCK = "mock"
 
 
 def get_execution_mode() -> ExecutionMode:
     """
     Resolve the active execution mode from the environment.
-    Falls back to API on unknown values.
+
+    TEST_MODE=true overrides EXECUTION_MODE and always returns MOCK so that
+    CI and smoke-test runs never touch the LLM APIs.
+    Falls back to API on unknown EXECUTION_MODE values.
     """
+    if TEST_MODE:
+        logger.info("TEST_MODE=true — forcing execution mode to MOCK")
+        return ExecutionMode.MOCK
+
     raw = _ENV_MODE.lower().strip()
     try:
         return ExecutionMode(raw)
@@ -82,5 +97,22 @@ def select_executor(mode: Optional[ExecutionMode] = None):
             expand=False,
         ))
         return ProNativeExecutor()
+
+    if mode == ExecutionMode.MOCK:
+        from mock.mock_executor import MockExecutor
+        test_layer_note = (
+            "\n[bold red]TEST_MODE=true — all LLM calls suppressed.[/bold red]"
+            if TEST_MODE else ""
+        )
+        logger.info("Execution mode: MOCK — no LLM calls, zero cost")
+        console.print(Panel(
+            "[bold yellow]Mock mode active — no LLM calls will be made.[/bold yellow]\n"
+            "[dim]Cost: $0.00  |  All outputs are pre-canned content.[/dim]\n"
+            "[dim]Engineer stage produces a hello_world.py application.[/dim]"
+            + test_layer_note,
+            title="[bold yellow]Mock Mode — Active[/bold yellow]",
+            expand=False,
+        ))
+        return MockExecutor()
 
     raise ValueError(f"Unhandled execution mode: {mode!r}")

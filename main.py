@@ -23,7 +23,7 @@ from rich.text import Text
 
 from callbacks import setup_logging, usage_handler
 from config import cfg
-from config.execution import EXECUTION_MODE as _DEFAULT_EXECUTION_MODE
+from config.execution import EXECUTION_MODE as _DEFAULT_EXECUTION_MODE, TEST_MODE as _TEST_MODE
 from graph.state import CognivCrewState, default_state
 from graph.workflow import app
 from orchestration.execution_selector import ExecutionMode, get_execution_mode, select_executor
@@ -108,6 +108,13 @@ def _check_items(exec_mode: ExecutionMode = ExecutionMode.API) -> list[tuple[str
             "Claude Code CLI authenticated (Pro plan)",
             ok,
             message if not ok else "",
+        ))
+    elif exec_mode == ExecutionMode.MOCK:
+        # Mock mode: no credentials required
+        items.append((
+            "Mock mode (no auth required)",
+            True,
+            "",
         ))
     else:
         # API mode: require ANTHROPIC_API_KEY
@@ -339,17 +346,24 @@ def run(
     langsmith: bool = typer.Option(False, "--langsmith", help="Enable LangSmith tracing"),
     mode: str = typer.Option(
         None, "--mode",
-        help="Execution mode: 'api' (default) or 'pro_native' (Claude Pro plan, no API key)",
+        help="Execution mode: 'api' (default), 'pro_native' (Claude Pro plan, no API key), or 'mock' (test layer — zero LLM calls)",
     ),
 ):
     """Run the full CognivCrew AI pipeline on a project description."""
-    # Resolve execution mode (CLI flag > env var > default "api")
-    raw_mode = mode or _DEFAULT_EXECUTION_MODE
-    try:
-        exec_mode = ExecutionMode(raw_mode.lower().strip())
-    except ValueError:
-        console.print(f"[red]Unknown --mode '{raw_mode}'. Choose 'api' or 'pro_native'.[/red]")
-        raise SystemExit(1)
+    # Resolve execution mode: TEST_MODE overrides everything → mock
+    if _TEST_MODE:
+        exec_mode = ExecutionMode.MOCK
+        if mode and mode.lower().strip() != "mock":
+            console.print(
+                f"[bold yellow]TEST_MODE=true — ignoring --mode '{mode}' and forcing mock.[/bold yellow]"
+            )
+    else:
+        raw_mode = mode or _DEFAULT_EXECUTION_MODE
+        try:
+            exec_mode = ExecutionMode(raw_mode.lower().strip())
+        except ValueError:
+            console.print(f"[red]Unknown --mode '{raw_mode}'. Choose 'api', 'pro_native', or 'mock'.[/red]")
+            raise SystemExit(1)
 
     _validate_startup(exec_mode=exec_mode)
 
@@ -369,11 +383,12 @@ def run(
     logger.info(f"Output directory: {output_dir}")
 
     request_preview = project if len(project) <= 80 else project[:77] + "..."
-    mode_display = (
-        f"[dim]Mode:[/dim]    [white]Pro Native (Claude Pro plan)[/white]\n"
-        if exec_mode == ExecutionMode.PRO_NATIVE
-        else f"[dim]Mode:[/dim]    [white]API (ANTHROPIC_API_KEY)[/white]\n"
-    )
+    if exec_mode == ExecutionMode.PRO_NATIVE:
+        mode_display = "[dim]Mode:[/dim]    [white]Pro Native (Claude Pro plan)[/white]\n"
+    elif exec_mode == ExecutionMode.MOCK:
+        mode_display = "[dim]Mode:[/dim]    [bold yellow]Mock (test layer — zero LLM calls)[/bold yellow]\n"
+    else:
+        mode_display = "[dim]Mode:[/dim]    [white]API (ANTHROPIC_API_KEY)[/white]\n"
     console.print(
         Panel(
             f"[bold yellow]{request_preview}[/bold yellow]\n\n"
@@ -391,6 +406,15 @@ def run(
 
     if exec_mode == ExecutionMode.PRO_NATIVE:
         _run_pro_native(
+            project=project,
+            output_dir=output_dir,
+            thread_id=thread_id,
+            wall_start=wall_start,
+        )
+        return
+
+    if exec_mode == ExecutionMode.MOCK:
+        _run_mock(
             project=project,
             output_dir=output_dir,
             thread_id=thread_id,
@@ -523,6 +547,93 @@ def _run_pro_native(
         f"{executor.cost_report()}"
     )
     _print_run_summary_pro_native(state, total_duration, executor)
+
+
+# ---------------------------------------------------------------------------
+# Mock execution helper
+# ---------------------------------------------------------------------------
+
+def _auto_approve_gate(_state) -> dict:
+    """Non-interactive approval callback used in TEST_MODE — always approves."""
+    logger.info("TEST_MODE: architect brief auto-approved (non-interactive)")
+    console.print(Panel(
+        "[bold green]Architect brief auto-approved.[/bold green] "
+        "[dim](TEST_MODE — non-interactive)[/dim]",
+        title="[bold cyan]Architect Agent[/bold cyan]",
+        expand=False,
+    ))
+    return {"architect_approved": True, "human_feedback": ""}
+
+
+def _run_mock(
+    project: str,
+    output_dir: Path,
+    thread_id: str,
+    wall_start: float,
+) -> None:
+    """Full pipeline execution in mock mode — zero LLM calls, zero cost."""
+    from mock.mock_executor import MockExecutor
+    from graph.workflow import final_node
+
+    executor = MockExecutor()
+
+    initial_state: CognivCrewState = {
+        **default_state(),
+        "user_request": project,
+        "output_dir": str(output_dir),
+    }
+
+    # Use non-interactive auto-approve when TEST_MODE is active so CI pipelines
+    # can run end-to-end without blocking on the architect review prompt.
+    approval_cb = _auto_approve_gate if _TEST_MODE else handle_approval_gate
+
+    state = executor.run_all(
+        initial_state,
+        approval_callback=approval_cb,
+        max_architect_iterations=cfg.MAX_ARCHITECT_ITERATIONS,
+    )
+
+    state = final_node(state)
+
+    total_duration = time.perf_counter() - wall_start
+    logger.info(f"Mock pipeline complete — {total_duration:.1f}s | {executor.cost_report()}")
+    _print_run_summary_mock(state, total_duration, executor)
+
+
+def _print_run_summary_mock(
+    state: CognivCrewState,
+    duration: float,
+    executor,
+) -> None:
+    qa_iterations        = state.get("iteration", 0)
+    architect_iterations = state.get("architect_iteration", 0)
+    output_dir           = state.get("output_dir", "—")
+
+    timing_lines = "\n".join(
+        f"  {_AGENT_LABELS.get(node, node):<44} {t:.1f}s"
+        for node, t in executor.agent_timings.items()
+    )
+
+    hw_path = Path(output_dir) / "hello_world.py"
+    hw_note = (
+        f"\n[bold]hello_world.py:[/bold]         {hw_path}"
+        if hw_path.exists() else ""
+    )
+
+    summary = (
+        f"[bold]Total duration:[/bold]         {duration:.1f}s\n"
+        f"[bold]Architect iterations:[/bold]   {architect_iterations}\n"
+        f"[bold]QA iterations:[/bold]          {qa_iterations}\n"
+        f"[bold]LLM calls:[/bold]              0\n"
+        f"[bold]Estimated cost:[/bold]         $0.00 (mock mode — no LLM calls)\n"
+        f"[bold]Output path:[/bold]            {output_dir}"
+        f"{hw_note}\n"
+        f"\n[bold]Per-agent timing:[/bold]\n{timing_lines}"
+    )
+
+    console.print(
+        Panel(summary, title="[bold green]Run Summary — Mock Mode[/bold green]", expand=False)
+    )
 
 
 # ---------------------------------------------------------------------------
